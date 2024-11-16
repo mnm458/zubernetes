@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+option go_package = "github.com/mnm458/zubernetes/api";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+package api;
+
+service WorkerService {
+    rpc StartTask(StartTaskRequest) returns (StartTaskResponse) {}
+    rpc GetTasks(google.protobuf.Empty) returns (GetTasksResponse){}
+    rpc StopTask(StopTaskRequest) returns (google.protobuf.Empty) {}
+}
+
+message StartTaskRequest {
+    TaskEvent task_event = 1;
+}
+
+message StartTaskResponse {
+    Task task = 1;
+}
+
+message TaskEvent {
+    bytes id = 1; 
+    int32 state = 2;
+    google.protobuf.Timestamp timestamp = 3;
+    Task task = 4;
+}
+
+message Task {
+    bytes id = 1; // UUID represented as string
+    string container_id = 2;
+    string name = 3;
+    int32 state = 4; // Assuming State is an integer, change to enum if needed
+    string image = 5;
+    int32 memory = 6; // Memory in MB or other units
+    int32 disk = 7; // Disk size in MB or other units
+
+    // Repeated field for exposed ports, as nat.PortSet is a map-like structure
+    repeated string exposed_ports = 8;
+
+    // Map for port bindings
+    map<string, string> port_bindings = 9;
+
+    string restart_policy = 10;
+
+    google.protobuf.Timestamp start_time = 11; // StartTime as Timestamp
+    google.protobuf.Timestamp finish_time = 12; // FinishTime as Timestamp
+}
+
+message GetTasksResponse{
+    repeated Task tasks = 1;
+}
+
+message StopTaskRequest{
+    bytes id = 1;
+}
