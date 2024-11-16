@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -25,6 +26,16 @@ const (
 	Failed
 )
 
+type GSCConfig struct {
+	// SGX-specific configurations
+	SGXDevicePath   string // Path to SGX device (e.g., "/dev/sgx_enclave")
+	AESMSocketPath  string // Path to AESM socket
+	GramineModeType string // "sgx" or "direct"
+	SigningKeyPath  string // Path to signing key for SGX enclave
+	ManifestPath    string // Path to Gramine manifest file
+	SeccompProfile  string // Path to seccomp profile for direct mode
+}
+
 type Task struct {
 	ID            uuid.UUID         `protobuf:"bytes,1,opt,name=id"`
 	ContainerID   string            `protobuf:"bytes,2,opt,name=container_id,json=containerId"`
@@ -38,6 +49,9 @@ type Task struct {
 	RestartPolicy string            `protobuf:"bytes,10,opt,name=restart_policy,json=restartPolicy"`
 	StartTime     time.Time         `protobuf:"bytes,11,opt,name=start_time,json=startTime"`
 	FinishTime    time.Time         `protobuf:"bytes,12,opt,name=finish_time,json=finishTime"`
+	GSCConfig     *GSCConfig        `protobuf:"bytes,13,opt,name=gsc_config,json=gscConfig"`
+	IsGSC         bool              `protobuf:"varint,14,opt,name=is_gsc,json=isGsc"`
+	GSCImageName  string            `protobuf:"bytes,15,opt,name=gsc_image_name,json=gscImageName"`
 }
 
 type TaskEvent struct {
@@ -59,6 +73,8 @@ type Config struct {
 	Env           []string
 	RestartPolicy string
 	Runtime       Runtime
+	GSCConfig     *GSCConfig
+	IsGSC         bool
 }
 type Runtime struct {
 	ContainerID string
@@ -95,6 +111,44 @@ func Contains(states []State, state State) bool {
 
 func ValidStateTransition(src State, dst State) bool {
 	return Contains(stateTransitionMap[src], dst)
+}
+
+func (d *Docker) prepareGSCImage(ctx context.Context) error {
+	if !d.Config.IsGSC {
+		return nil
+	}
+
+	// 1. Build GSC image using gsc build
+	buildCmd := []string{
+		"gsc", "build",
+		"--insecure-args", // Note: Remove in production if you don't need runtime args
+		d.Config.Image,
+		d.Config.GSCConfig.ManifestPath,
+	}
+	// Execute build command
+	if err := executeCommand(buildCmd); err != nil {
+		return fmt.Errorf("failed to build GSC image: %v", err)
+	}
+
+	// 2. Sign the GSC image
+	signCmd := []string{
+		"gsc", "sign-image",
+		d.Config.Image,
+		d.Config.GSCConfig.SigningKeyPath,
+	}
+	// Execute sign command
+	if err := executeCommand(signCmd); err != nil {
+		return fmt.Errorf("failed to sign GSC image: %v", err)
+	}
+
+	// Update image name to GSC version
+	d.Config.GSCImageName = fmt.Sprintf("gsc-%s", d.Config.Image)
+	return nil
+}
+
+func executeCommand(cmd []string) error {
+	// Implement command execution logic here
+	return nil
 }
 
 func (d *Docker) Run() DockerResult {
