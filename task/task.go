@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -26,15 +27,11 @@ const (
 	Failed
 )
 
-type GSCConfig struct {
-	// SGX-specific configurations
-	SGXDevicePath   string // Path to SGX device (e.g., "/dev/sgx_enclave")
-	AESMSocketPath  string // Path to AESM socket
-	GramineModeType string // "sgx" or "direct"
-	SigningKeyPath  string // Path to signing key for SGX enclave
-	ManifestPath    string // Path to Gramine manifest file
-	SeccompProfile  string // Path to seccomp profile for direct mode
-}
+const (
+	StandardBinaryName = "app.bin"
+	StandardBuildName  = "build"
+	GSCScriptName      = "launch-gsc.sh"
+)
 
 type Task struct {
 	ID            uuid.UUID         `protobuf:"bytes,1,opt,name=id"`
@@ -49,9 +46,6 @@ type Task struct {
 	RestartPolicy string            `protobuf:"bytes,10,opt,name=restart_policy,json=restartPolicy"`
 	StartTime     time.Time         `protobuf:"bytes,11,opt,name=start_time,json=startTime"`
 	FinishTime    time.Time         `protobuf:"bytes,12,opt,name=finish_time,json=finishTime"`
-	GSCConfig     *GSCConfig        `protobuf:"bytes,13,opt,name=gsc_config,json=gscConfig"`
-	IsGSC         bool              `protobuf:"varint,14,opt,name=is_gsc,json=isGsc"`
-	GSCImageName  string            `protobuf:"bytes,15,opt,name=gsc_image_name,json=gscImageName"`
 }
 
 type TaskEvent struct {
@@ -73,8 +67,8 @@ type Config struct {
 	Env           []string
 	RestartPolicy string
 	Runtime       Runtime
-	GSCConfig     *GSCConfig
-	IsGSC         bool
+	GSCConfig     *GSCConfig `protobuf:"bytes,13,opt,name=gsc_config,json=gscConfig"`
+	IsGSC         bool       `protobuf:"varint,14,opt,name=is_gsc,json=isGsc"`
 }
 type Runtime struct {
 	ContainerID string
@@ -90,6 +84,13 @@ type DockerResult struct {
 	Action      string
 	ContainerId string
 	Result      string
+}
+type GSCConfig struct {
+	SGXDevicePath  string // Path to SGX device (e.g., "/dev/sgx_enclave")
+	AESMSocketPath string // Path to AESM socket
+	BinaryInput    string // Path to input binary file
+	RustBuildInput string // Path to input Rust build
+	ScriptPath     string // Path to GSC launch script
 }
 
 var stateTransitionMap = map[State][]State{
@@ -111,44 +112,6 @@ func Contains(states []State, state State) bool {
 
 func ValidStateTransition(src State, dst State) bool {
 	return Contains(stateTransitionMap[src], dst)
-}
-
-func (d *Docker) prepareGSCImage(ctx context.Context) error {
-	if !d.Config.IsGSC {
-		return nil
-	}
-
-	// 1. Build GSC image using gsc build
-	buildCmd := []string{
-		"gsc", "build",
-		"--insecure-args", // Note: Remove in production if you don't need runtime args
-		d.Config.Image,
-		d.Config.GSCConfig.ManifestPath,
-	}
-	// Execute build command
-	if err := executeCommand(buildCmd); err != nil {
-		return fmt.Errorf("failed to build GSC image: %v", err)
-	}
-
-	// 2. Sign the GSC image
-	signCmd := []string{
-		"gsc", "sign-image",
-		d.Config.Image,
-		d.Config.GSCConfig.SigningKeyPath,
-	}
-	// Execute sign command
-	if err := executeCommand(signCmd); err != nil {
-		return fmt.Errorf("failed to sign GSC image: %v", err)
-	}
-
-	// Update image name to GSC version
-	d.Config.GSCImageName = fmt.Sprintf("gsc-%s", d.Config.Image)
-	return nil
-}
-
-func executeCommand(cmd []string) error {
-	// Implement command execution logic here
-	return nil
 }
 
 func (d *Docker) Run() DockerResult {
@@ -196,6 +159,136 @@ func (d *Docker) Run() DockerResult {
 		Action:      "start",
 		Result:      "success",
 	}
+}
+
+func (d *Docker) RunGcs() DockerResult {
+	ctx := context.Background()
+
+	if d.Config.IsGSC {
+		// Prepare workspace for GSC
+		workDir, err := d.prepareGSCWorkspace()
+		if err != nil {
+			return DockerResult{Error: err}
+		}
+		defer os.RemoveAll(workDir) // Cleanup after container is started
+
+		// Create container with GSC configuration
+		return d.runGSCContainer(ctx, workDir)
+	}
+
+	// Regular container logic...
+	return d.Run()
+}
+
+// Prepare workspace for GSC
+func (d *Docker) prepareGSCWorkspace() (string, error) {
+	// Create temporary workspace
+	workDir, err := os.MkdirTemp("", "gsc-workspace-")
+	if err != nil {
+		return "", fmt.Errorf("failed to create workspace: %v", err)
+	}
+
+	// Copy binary with standardized name
+	if err := copyFile(d.Config.GSCConfig.BinaryInput,
+		filepath.Join(workDir, StandardBinaryName)); err != nil {
+		os.RemoveAll(workDir)
+		return "", fmt.Errorf("failed to copy binary: %v", err)
+	}
+
+	// Copy Rust build with standardized name
+	if err := copyFile(d.Config.GSCConfig.RustBuildInput,
+		filepath.Join(workDir, StandardBuildName)); err != nil {
+		os.RemoveAll(workDir)
+		return "", fmt.Errorf("failed to copy build: %v", err)
+	}
+
+	// Copy GSC launch script
+	if err := copyFile(d.Config.GSCConfig.ScriptPath,
+		filepath.Join(workDir, GSCScriptName)); err != nil {
+		os.RemoveAll(workDir)
+		return "", fmt.Errorf("failed to copy launch script: %v", err)
+	}
+
+	return workDir, nil
+}
+
+func (d *Docker) runGSCContainer(ctx context.Context, workDir string) DockerResult {
+	// Container configuration
+	cc := &container.Config{
+		Image: d.Config.Image,
+		Cmd:   []string{"/workspace/" + GSCScriptName}, // Run the launch script
+		Env:   d.Config.Env,
+	}
+
+	// Host configuration
+	hc := &container.HostConfig{
+		Binds: []string{
+			// Mount workspace directory
+			fmt.Sprintf("%s:/workspace", workDir),
+			// Mount SGX device and AESM socket
+			fmt.Sprintf("%s:%s", d.Config.GSCConfig.SGXDevicePath, "/dev/sgx_enclave"),
+			fmt.Sprintf("%s:%s", d.Config.GSCConfig.AESMSocketPath, "/var/run/aesmd/aesm.socket"),
+		},
+		// Add SGX device
+		// Devices: []container.DeviceMapping{
+		// 	{
+		// 		PathOnHost:        d.Config.GSCConfig.SGXDevicePath,
+		// 		PathInContainer:   "/dev/sgx_enclave",
+		// 		CgroupPermissions: "rwm",
+		// 	},
+		// },
+		RestartPolicy: container.RestartPolicy{
+			Name: container.RestartPolicyMode(d.Config.RestartPolicy),
+		},
+		Resources: container.Resources{
+			Memory: d.Config.Memory,
+		},
+	}
+
+	// Create and start container
+	resp, err := d.Client.ContainerCreate(ctx, cc, hc, nil, nil, d.Config.Name)
+	if err != nil {
+		return DockerResult{Error: err}
+	}
+
+	// Start container
+	if err := d.Client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return DockerResult{Error: err}
+	}
+
+	// Get logs
+	out, err := d.Client.ContainerLogs(ctx, resp.ID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+	})
+	if err != nil {
+		return DockerResult{Error: err}
+	}
+	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
+
+	return DockerResult{
+		ContainerId: resp.ID,
+		Action:      "start",
+		Result:      "success",
+	}
+}
+
+// Helper function to copy files
+func copyFile(src, dst string) error {
+	source, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+
+	_, err = io.Copy(destination, source)
+	return err
 }
 
 func (d *Docker) Stop(id string) DockerResult {
